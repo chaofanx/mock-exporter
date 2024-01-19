@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+var (
+	Version string
+	Branch  string
+)
+
 func startWebServer(port int, path, mock *string) error {
 	addr := fmt.Sprintf(":%d", port)
 
@@ -86,7 +91,8 @@ func main() {
 	u, _ := user.Current()
 	version.BuildUser = u.Name
 	version.BuildDate = time.Now().Format("2006-01-02 15:04:05")
-	version.Branch = "master"
+	version.Branch = Branch
+	version.Version = Version
 	kingpin.Version(version.Print("mock_exporter"))
 	kingpin.CommandLine.UsageWriter(os.Stdout)
 	kingpin.HelpFlag.Short('h')
