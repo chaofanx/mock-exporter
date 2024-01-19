@@ -22,11 +22,11 @@ jobs:
         go-version: '1.21'
 
     - name: Build
-      run: go build -ldflags "-X main.Version=${{  github.ref_name }}" "-X main.Brancd=${{ github.ref }}" main.go
+      run: go build -ldflags "-X main.Version=${{  github.ref_name }}" "-X main.Brancd=master" main.go
 
     - uses: ncipollo/release-action@v1
       with:
         artifacts: "mock-exporter"
-        token: ${{ secrets.GITHUB_TOKEN }}
+        token: ${{ secrets.MY_TOKEN }}
         allowUpdates: true
         
