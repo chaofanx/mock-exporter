@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	"log"
+	"mock-exporter/common"
 	"net"
 	"net/http"
 	"os"
@@ -23,9 +24,10 @@ import (
 	"os/user"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
-func startWebServer(port int, path, mock *string) (func(server *http.Server), error) {
+func startWebServer(port int, path, mock *string, chaos *float64) (func(server *http.Server), error) {
 	addr := fmt.Sprintf(":%d", port)
 
 	// Check if the port is already in use
@@ -36,7 +38,7 @@ func startWebServer(port int, path, mock *string) (func(server *http.Server), er
 	listener.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(*path, getHandle(mock))
+	mux.HandleFunc(*path, getHandle(mock, chaos))
 	// Start the web server
 	server := &http.Server{
 		Addr:    addr,
@@ -68,7 +70,9 @@ func getLabelValues(labels []*dto.LabelPair) []string {
 	return result
 }
 
-func getHandle(mock *string) func(w http.ResponseWriter, r *http.Request) {
+// getHandle returns a handler function that serves the metrics from the given file
+// The file should be in prometheus text format
+func getHandle(mock *string, chaos *float64) func(w http.ResponseWriter, r *http.Request) {
 	registry := prometheus.NewRegistry()
 	file, err := os.Open(*mock)
 	var parser expfmt.TextParser
@@ -92,6 +96,18 @@ func getHandle(mock *string) func(w http.ResponseWriter, r *http.Request) {
 			registry.MustRegister(counter)
 			for _, metricValue := range metric.Metric {
 				counter.WithLabelValues(getLabelValues(metricValue.Label)...).Add(*metricValue.Counter.Value)
+				var counterValue = metricValue
+				go func() {
+					// Generate random numbers using normal distribution
+					for {
+						vibration := common.RandVibrate(1, *chaos)
+						if vibration < 0 {
+							vibration = 0
+						}
+						counter.WithLabelValues(getLabelValues(counterValue.Label)...).Add(vibration)
+						time.Sleep(time.Duration(1000) * time.Millisecond)
+					}
+				}()
 			}
 		case dto.MetricType_GAUGE:
 			if len(metric.Metric) < 1 {
@@ -105,6 +121,15 @@ func getHandle(mock *string) func(w http.ResponseWriter, r *http.Request) {
 			registry.MustRegister(gauge)
 			for _, metricValue := range metric.Metric {
 				gauge.WithLabelValues(getLabelValues(metricValue.Label)...).Set(*metricValue.Gauge.Value)
+				var gaugeValue = metricValue
+				go func() {
+					// Generate random numbers using normal distribution
+					for {
+						vibration := common.RandVibrate(*gaugeValue.Gauge.Value, *chaos)
+						gauge.WithLabelValues(getLabelValues(gaugeValue.Label)...).Set(vibration)
+						time.Sleep(time.Duration(1000) * time.Millisecond)
+					}
+				}()
 			}
 		case dto.MetricType_SUMMARY:
 			if len(metric.Metric) < 1 {
@@ -172,6 +197,11 @@ func main() {
 			"web.length",
 			"The length of the port range (starting from the starting value. If any port is occupied, it will be skipped.)",
 		).Default("50").Int()
+
+		chaos = kingpin.Flag(
+			"chaos",
+			"Chaos coefficient",
+		).Short('c').Default("1.0").Float64()
 	)
 
 	stopChan := make(chan os.Signal, 1)
@@ -191,11 +221,13 @@ func main() {
 		level.Warn(logger).Log("msg", "Node Exporter is running as root user. This exporter is designed to run as unprivileged user, root is not required.")
 	}
 
+	level.Info(logger).Log("msg", fmt.Sprintf("Current chaos is %f", *chaos))
+
 	var portUsed int32 = 0
 	for i := 0; i < *portLength; i++ {
 		port := *portStart + i
 		go func(p int) {
-			_, err := startWebServer(p, metricsPath, mock)
+			_, err := startWebServer(p, metricsPath, mock, chaos)
 			if err != nil {
 				fmt.Printf("Error starting server on port %d: %v\n", p, err)
 			}
