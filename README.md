@@ -35,9 +35,3 @@ $ ./mock_exporter -m ./node-exporter.prom
 ```bash
 $ go build -o mock_exporter
 ```
-
-## Next
-
-- [ ] Support for multiple files
-- [ ] Support for multiple paths
-- [ ] Support for multiple mock types

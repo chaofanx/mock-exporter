@@ -1,65 +1,153 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"os/user"
-	"sync"
 	"sync/atomic"
-	"time"
+	"syscall"
 )
 
-var (
-	Version string
-	Branch  string
-)
-
-func startWebServer(port int, path, mock *string) error {
+func startWebServer(port int, path, mock *string) (func(server *http.Server), error) {
 	addr := fmt.Sprintf(":%d", port)
 
 	// Check if the port is already in use
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer listener.Close()
+	listener.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(*path, GetHandle(mock))
-
+	mux.HandleFunc(*path, getHandle(mock))
 	// Start the web server
-	err = http.Serve(listener, mux)
-	if err != nil {
-		return err
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
-
-	return nil
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Printf("Server failed to start: %v\n", err)
+	}
+	return func(server *http.Server) {
+		if err := server.Shutdown(context.Background()); err != nil {
+			fmt.Printf("Server shutdown error: %v\n", err)
+		}
+	}, nil
 }
 
-func ReadFile(name string) (string, error) {
-	file, err := os.ReadFile(name)
-	if err != nil {
-		return "", err
+func getLabelNames(labels []*dto.LabelPair) []string {
+	var result []string
+	for _, label := range labels {
+		result = append(result, *label.Name)
 	}
-	return string(file), nil
+	return result
 }
 
-func GetHandle(mock *string) func(w http.ResponseWriter, r *http.Request) {
-	// read file to string
-	file, err := ReadFile(*mock)
+func getLabelValues(labels []*dto.LabelPair) []string {
+	var result []string
+	for _, label := range labels {
+		result = append(result, *label.Value)
+	}
+	return result
+}
+
+func getHandle(mock *string) func(w http.ResponseWriter, r *http.Request) {
+	registry := prometheus.NewRegistry()
+	file, err := os.Open(*mock)
+	var parser expfmt.TextParser
+	metrics, err := parser.TextToMetricFamilies(bufio.NewReader(file))
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to decode metrics: %v", err)
 	}
 
+	for _, metric := range metrics {
+		metricType := *metric.Type
+		switch metricType {
+		case dto.MetricType_COUNTER:
+			if len(metric.Metric) < 1 {
+				fmt.Printf("No metric values for %v\n", *metric.Name)
+				continue
+			}
+			counter := prometheus.NewCounterVec(prometheus.CounterOpts{
+				Name: *metric.Name,
+				Help: *metric.Help,
+			}, getLabelNames(metric.Metric[0].Label))
+			registry.MustRegister(counter)
+			for _, metricValue := range metric.Metric {
+				counter.WithLabelValues(getLabelValues(metricValue.Label)...).Add(*metricValue.Counter.Value)
+			}
+		case dto.MetricType_GAUGE:
+			if len(metric.Metric) < 1 {
+				fmt.Printf("No metric values for %v\n", *metric.Name)
+				continue
+			}
+			gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Name: *metric.Name,
+				Help: *metric.Help,
+			}, getLabelNames(metric.Metric[0].Label))
+			registry.MustRegister(gauge)
+			for _, metricValue := range metric.Metric {
+				gauge.WithLabelValues(getLabelValues(metricValue.Label)...).Set(*metricValue.Gauge.Value)
+			}
+		case dto.MetricType_SUMMARY:
+			if len(metric.Metric) < 1 {
+				fmt.Printf("No metric values for %v\n", *metric.Name)
+				continue
+			}
+			summary := prometheus.NewSummaryVec(prometheus.SummaryOpts{
+				Name: *metric.Name,
+				Help: *metric.Help,
+			}, getLabelNames(metric.Metric[0].Label))
+			registry.MustRegister(summary)
+			for _, metricValue := range metric.Metric {
+				summary.WithLabelValues(getLabelValues(metricValue.Label)...).Observe(*metricValue.Summary.SampleSum)
+			}
+		case dto.MetricType_HISTOGRAM:
+			if len(metric.Metric) < 1 {
+				fmt.Printf("No metric values for %v\n", *metric.Name)
+				continue
+			}
+			histogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+				Name: *metric.Name,
+				Help: *metric.Help,
+			}, getLabelNames(metric.Metric[0].Label))
+			registry.MustRegister(histogram)
+			for _, metricValue := range metric.Metric {
+				histogram.WithLabelValues(getLabelValues(metricValue.Label)...).Observe(*metricValue.Histogram.SampleSum)
+			}
+		default:
+			fmt.Printf("Unknown metric type: %v\n", metricType)
+		}
+	}
+
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
+	handler := promhttp.HandlerFor(registry,
+		promhttp.HandlerOpts{
+			EnableOpenMetrics: true,
+		})
 	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, file)
+		handler.ServeHTTP(w, r)
 	}
 }
 
@@ -86,13 +174,11 @@ func main() {
 		).Default("50").Int()
 	)
 
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
+
 	promlogConfig := &promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
-	u, _ := user.Current()
-	version.BuildUser = u.Name
-	version.BuildDate = time.Now().Format("2006-01-02 15:04:05")
-	version.Branch = Branch
-	version.Version = Version
 	kingpin.Version(version.Print("mock_exporter"))
 	kingpin.CommandLine.UsageWriter(os.Stdout)
 	kingpin.HelpFlag.Short('h')
@@ -105,15 +191,11 @@ func main() {
 		level.Warn(logger).Log("msg", "Node Exporter is running as root user. This exporter is designed to run as unprivileged user, root is not required.")
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(*portLength)
-
 	var portUsed int32 = 0
 	for i := 0; i < *portLength; i++ {
 		port := *portStart + i
 		go func(p int) {
-			defer wg.Done()
-			err := startWebServer(p, metricsPath, mock)
+			_, err := startWebServer(p, metricsPath, mock)
 			if err != nil {
 				fmt.Printf("Error starting server on port %d: %v\n", p, err)
 			}
@@ -121,7 +203,10 @@ func main() {
 		}(port)
 	}
 
-	wg.Wait()
-
 	level.Info(logger).Log("msg", fmt.Sprintf("%d ports have started listening and the application started successfully", portUsed))
+
+	<-stopChan
+
+	level.Info(logger).Log("msg", "Received SIGINT/SIGTERM, exiting gracefully...")
+
 }
